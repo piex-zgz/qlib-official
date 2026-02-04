@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 # ================= ⚙️ 配置区 =================
 # Qwen
-# API_KEY = "sk-62b3731cd79a4ae2841b952e43d491fc" 
+# API_KEY = "sk-xxxxxxxxxxx" 
 # BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"    
 
 # MODEL_NAME = "qwen3-max-2026-01-23"
