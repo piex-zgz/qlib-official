@@ -14,7 +14,7 @@ from tqdm import tqdm
 # BATCH_SIZE = 10
 
 # Gemini
-API_KEY = "ut_e697d4dc724e4e39b54a8fc2" 
+API_KEY = "ut_xxxxxxxxxxxxx" 
 BASE_URL = "https://hk1.augmunt.com"    
 
 MODEL_NAME = "gemini-3-pro-preview"
