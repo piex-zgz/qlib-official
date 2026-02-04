@@ -1,0 +1,1 @@
+& C:/Users/ZGZ/anaconda3/envs/qlib/python.exe scripts/data_collector/cn_index/collector.py --index_name CSI300 --qlib_dir D:/Quant-qlib-official/data/qlib_data --method save_new_companies
