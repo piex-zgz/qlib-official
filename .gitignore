@@ -51,3 +51,15 @@ tags
 ./pretrain
 .idea/
 .aider*
+
+# Data directories
+data/LLM-models/
+data/qlib_data/
+data/source/
+data/normalize/
+
+# My-quant outputs
+my-quant/models/
+my-quant/plots/
+my-quant/logs/
+my-quant/.live_backtest_state.json
