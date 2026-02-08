@@ -145,10 +145,13 @@ live_backtest:
   state_file: .live_backtest_state.json
 ```
 
-**已知问题修复记录（2026-02-06）：**
+**已知问题修复记录（2026-02-08）：**
 1. ✅ 修复 T+1 交易规则违反问题（原先用同日数据预测和交易）
 2. ✅ 修复价格数据获取 bug（卖出股票时无法获取价格，导致虚假亏损）
 3. ✅ 修复预测数据 MultiIndex 处理问题
 4. ✅ 修复 JSON 状态文件数字类型转换问题
+5. ✅ 添加 pending 交易列表持久化（数据未就绪时保存信号，待数据更新后计算收益）
+6. ✅ 添加 `check_pending` 命令手动触发 pending 收益计算
+7. ✅ 修复 JSON 序列化 tuple key 问题（MultiIndex 转 dict 时的 tuple key）
 
 ## Code Standards

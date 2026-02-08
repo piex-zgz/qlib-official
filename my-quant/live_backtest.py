@@ -23,6 +23,7 @@
 """
 
 import json
+import traceback
 from datetime import datetime
 from pathlib import Path
 from loguru import logger
@@ -102,7 +103,21 @@ class LiveBacktest:
         return None
 
     def _convert_state_types(self, state: dict):
-        """将状态中的字符串转换回数字类型"""
+        """将状态中的字符串转换回数字类型，处理版本迁移"""
+        # 1. 迁移旧版本：添加 last_data_update_date 字段
+        if 'last_data_update_date' not in state:
+            logger.info("检测到旧版本状态文件，添加 last_data_update_date 字段...")
+            # 从 qlib 数据库获取最后日期
+            try:
+                from qlib.data import D
+                calendar = D.calendar(freq='day')
+                state['last_data_update_date'] = calendar[-1].strftime('%Y-%m-%d')
+            except Exception as e:
+                logger.warning(f"无法从 qlib 获取日期: {e}，使用 last_update_date")
+                state['last_data_update_date'] = state.get('last_update_date', '2024-01-01')
+            logger.info(f"迁移后 last_data_update_date = {state['last_data_update_date']}")
+
+        # 2. 转换数字类型
         if 'account' in state:
             account = state['account']
             if 'cash' in account and isinstance(account['cash'], str):
@@ -117,19 +132,94 @@ class LiveBacktest:
             if 'total_values' in history:
                 history['total_values'] = [float(v) if isinstance(v, str) else v for v in history['total_values']]
 
+        # 3. 迁移旧版本：添加 pending_trades 字段
+        if 'pending_trades' not in state:
+            logger.info("检测到旧版本状态文件，添加 pending_trades 字段...")
+            state['pending_trades'] = []
+            logger.info("pending_trades 字段已初始化为空列表")
+
+        # 4. 转换 predictions 为 pandas Series（如果存储为 dict）
+        # 注意：predictions 现在不持久化，只有 pending_trades 中的 pred_df 需要处理
+        if 'predictions' in state:
+            pred = state['predictions']
+            if isinstance(pred, dict):
+                try:
+                    state['predictions'] = pd.Series(pred)
+                    logger.debug("predictions 已从 dict 恢复为 pandas Series")
+                except Exception as e:
+                    logger.warning(f"恢复 predictions 失败: {e}")
+                    del state['predictions']
+
     def _save_state(self, state: dict):
         """保存状态"""
+        import copy
+
+        # 创建深拷贝，避免修改原对象
+        state_copy = copy.deepcopy(state)
+
+        # 递归处理所有 pandas 对象和 tuple key
+        state_copy = self._process_for_json(state_copy)
+
         with open(self.state_file, 'w', encoding='utf-8') as f:
-            json.dump(state, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(state_copy, f, ensure_ascii=False, indent=2)
         logger.info(f"状态已保存到: {self.state_file}")
 
+    def _process_for_json(self, obj):
+        """递归处理对象，确保可以 JSON 序列化"""
+        import copy
+
+        obj_copy = copy.deepcopy(obj)
+
+        if isinstance(obj_copy, pd.Series):
+            # Series -> dict
+            return obj_copy.to_dict()
+
+        elif isinstance(obj_copy, pd.DataFrame):
+            # DataFrame -> dict
+            return obj_copy.to_dict(orient='index')
+
+        elif isinstance(obj_copy, dict):
+            # 递归处理 dict
+            return {k: self._process_for_json(v) for k, v in obj_copy.items()}
+
+        elif isinstance(obj_copy, (list, tuple)):
+            # 递归处理 list/tuple
+            return [self._process_for_json(item) for item in obj_copy]
+
+        else:
+            # 原始类型，直接返回
+            return obj_copy
+
     def _get_latest_trading_day(self) -> str:
-        """获取最新的交易日"""
-        from qlib.data import D
-        calendar = D.calendar(freq='day')
-        if len(calendar) == 0:
-            raise ValueError("无法获取交易日历，请检查数据是否已准备")
-        return calendar[-1].strftime('%Y-%m-%d')
+        """获取最新的交易日（从 akshare 实时获取）"""
+        import akshare as ak
+
+        try:
+            # 从 akshare 获取交易日历
+            logger.debug("从 akshare 获取交易日历...")
+            calendar_df = ak.tool_trade_date_hist_sina()
+            calendar_df['trade_date'] = pd.to_datetime(calendar_df['trade_date'])
+
+            # 只取今天及之前的交易日
+            today = datetime.now().date()
+            valid_dates = calendar_df[calendar_df['trade_date'].dt.date <= today]
+
+            if len(valid_dates) == 0:
+                raise ValueError("没有找到有效的交易日")
+
+            latest = valid_dates['trade_date'].max()
+            latest_str = latest.strftime('%Y-%m-%d')
+            logger.debug(f"最新交易日: {latest_str}")
+            return latest_str
+
+        except Exception as e:
+            logger.warning(f"从 akshare 获取交易日历失败: {e}，回退到本地 qlib 数据")
+            # 降级方案：使用本地 qlib 数据
+            from qlib.data import D
+            calendar = D.calendar(freq='day')
+            if len(calendar) == 0:
+                raise ValueError("无法获取交易日历，请检查数据是否已准备")
+            return calendar[-1].strftime('%Y-%m-%d')
 
     def _normalize_date(self, date_str: str) -> str:
         """
@@ -160,6 +250,448 @@ class LiveBacktest:
         except Exception:
             logger.warning(f"无法解析日期格式: {date_str}")
             return None
+
+    def _get_local_data_latest_date(self) -> str:
+        """
+        检查本地数据的最后日期
+
+        Returns:
+            str: 本地数据的最后日期（YYYY-MM-DD 格式），如果没有数据返回 None
+        """
+        data_dir = Path(self.config.get('data', {}).get('save_dir', 'data/source'))
+
+        if not data_dir.exists():
+            return None
+
+        # 获取一个股票文件来检查日期（使用 SH000300 指数文件更可靠）
+        benchmark_file = data_dir / "SH000300.csv"
+        if benchmark_file.exists():
+            try:
+                import pandas as pd
+                df = pd.read_csv(benchmark_file)
+                if 'date' in df.columns:
+                    latest = df['date'].max()
+                    logger.info(f"本地数据最后日期: {latest}")
+                    return latest
+            except Exception as e:
+                logger.warning(f"读取本地数据日期失败: {e}")
+
+        # 或者检查任意一个股票文件
+        csv_files = list(data_dir.glob("SH*.csv")) + list(data_dir.glob("SZ*.csv"))
+        if csv_files:
+            try:
+                import pandas as pd
+                sample_file = csv_files[0]
+                df = pd.read_csv(sample_file, usecols=['date'])
+                latest = df['date'].max()
+                logger.info(f"本地数据最后日期（来自 {sample_file.name}）: {latest}")
+                return latest
+            except:
+                pass
+
+        return None
+
+    def _update_data(self, target_date: str = None, force_full: bool = False) -> bool:
+        """
+        自动更新数据（股票 + 指数）
+
+        Args:
+            target_date: 更新到这个日期（格式：YYYY-MM-DD 或 YYYYMMDD），默认为今天
+            force_full: 是否强制完整下载（跳过本地数据检查）
+
+        Returns:
+            bool: 更新是否成功
+        """
+        import subprocess
+        import sys
+
+        try:
+            # 1. 确定目标日期
+            data_config = self.config.get('data', {})
+
+            if target_date is None:
+                target_date = self._get_latest_trading_day()
+            else:
+                target_date = self._normalize_date(target_date)
+
+            # 转换为 YYYYMMDD 格式（用于下载脚本）
+            target_date_num = target_date.replace('-', '')
+
+            # 2. 确定开始下载的日期
+            if not force_full:
+                # 增量模式：从上次更新日期开始
+                last_data_date = self.state.get('last_data_update_date')
+                if last_data_date is None:
+                    # 如果状态文件没有，尝试从本地数据获取
+                    last_data_date = self._get_local_data_latest_date()
+                    if last_data_date:
+                        logger.info(f"从本地数据获取到上次更新日期: {last_data_date}")
+                    else:
+                        last_data_date = '20240101'
+                        logger.warning("无法获取上次更新日期，使用默认值")
+
+                start_date_num = last_data_date.replace('-', '')
+                logger.info(f"增量数据更新: {start_date_num} → {target_date_num}")
+
+                # 如果已经是最新，跳过
+                if start_date_num >= target_date_num:
+                    logger.info(f"数据已是最新（{last_data_date}），无需更新")
+                    return True
+            else:
+                # 完整模式：先检查本地数据
+                local_date = self._get_local_data_latest_date()
+                if local_date:
+                    # 本地有数据，从本地最后日期开始
+                    start_date_num = local_date.replace('-', '')
+                    logger.info(f"完整模式：本地数据最新日期为 {local_date}")
+                    logger.info(f"从 {local_date} 开始增量下载: {start_date_num} → {target_date_num}")
+
+                    # 检查是否需要下载
+                    if start_date_num >= target_date_num:
+                        logger.info(f"数据已是最新（{local_date}），无需更新")
+                        return True
+                else:
+                    # 本地没有数据，从配置的开始日期
+                    start_date = str(data_config.get('start_date', '20080101'))
+                    start_date_num = start_date
+                    logger.info(f"完整数据下载（本地无数据）: {start_date} → {target_date_num}")
+
+            # 2. 下载股票数据
+            logger.info("步骤 1/5: 下载股票数据...")
+            get_data_script = self.base_dir / "get_data.py"
+            result = subprocess.run(
+                [sys.executable, str(get_data_script), "download",
+                 "--start_date", start_date_num,
+                 "--end_date", target_date_num,
+                 "--max_workers", "12"],
+                check=False  # 不检查返回值，输出会直接显示
+            )
+            logger.info("股票数据下载完成")
+
+            # 3. 下载指数数据
+            logger.info("步骤 2/5: 下载指数数据...")
+            benchmark_script = self.base_dir / "download_benchmark.py"
+            subprocess.run(
+                [sys.executable, str(benchmark_script)],
+                check=False,
+                env={**subprocess.os.environ,
+                     "BENCHMARK_START_DATE": start_date_num,
+                     "BENCHMARK_END_DATE": target_date_num}
+            )
+            logger.info("指数数据下载完成")
+
+            # 3.5 更新 CSI300 成分股列表（使用 qlib 的 collector）
+            logger.info("步骤 2.5/5: 更新 CSI300 成分股列表...")
+            qlib_dir = Path(self.config['data']['qlib_dir']).expanduser()
+            collector_script = qlib_dir.parent / "scripts" / "data_collector" / "cn_index" / "collector.py"
+            if collector_script.exists():
+                subprocess.run(
+                    [sys.executable, str(collector_script),
+                     "--index_name", "CSI300",
+                     "--qlib_dir", str(qlib_dir),
+                     "--method", "parse_instruments"],
+                    check=False
+                )
+                logger.info("CSI300 成分股列表已更新")
+            else:
+                logger.warning(f"找不到 collector 脚本: {collector_script}")
+
+            # 4. 规范化数据
+            logger.info("步骤 3/5: 规范化数据...")
+            normalize_script = self.base_dir / "normalize.py"
+            subprocess.run(
+                [sys.executable, str(normalize_script), "normalize"],
+                check=False
+            )
+            logger.info("数据规范化完成")
+
+            # 5. 更新 qlib 二进制数据
+            logger.info("步骤 4/5: 更新 qlib 二进制数据...")
+            train_script = self.base_dir / "train.py"
+            subprocess.run(
+                [sys.executable, str(train_script), "dump_bin"],
+                check=False
+            )
+            logger.info("qlib 数据库更新完成")
+
+            # 6. 更新状态
+            logger.info("步骤 5/5: 更新状态...")
+            self.state['last_data_update_date'] = target_date
+            self._save_state(self.state)
+
+            logger.info(f"数据更新成功！当前数据截止: {target_date}")
+
+            # 7. 检查并计算 pending 收益
+            logger.info("检查并计算待处理的 pending 收益...")
+            calculated = self._calculate_pending_returns(target_date)
+            if calculated > 0:
+                logger.info(f"已计算 {calculated} 个 pending 交易的收益")
+                self._save_state(self.state)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"数据更新异常: {e}")
+            logger.error(f"完整堆栈跟踪:\n{traceback.format_exc()}")
+            return False
+
+    def _calculate_pending_returns(self, target_date: str) -> int:
+        """
+        计算待处理的 pending 收益
+
+        当数据更新后，检查是否有 pending 的交易可以计算收益了
+
+        Args:
+            target_date: 更新后的数据截止日期（YYYY-MM-DD）
+
+        Returns:
+            int: 计算的 pending 交易数量
+        """
+        pending_trades = self.state.get('pending_trades', [])
+
+        if not pending_trades:
+            logger.debug("没有待计算的 pending 交易")
+            return 0
+
+        logger.info(f"检查 {len(pending_trades)} 个待计算的 pending 交易...")
+
+        from qlib.data import D
+        calendar = D.calendar(freq='day')
+        calendar_dates = [d.strftime('%Y-%m-%d') for d in calendar]
+
+        calculated_count = 0
+        remaining_trades = []
+
+        for pending in pending_trades:
+            pred_date = pending.get('pred_date')  # 预测数据日期 (T)
+            trade_date = pending.get('trade_date')  # 交易日期 (T+1)
+
+            logger.info(f"检查 pending 交易: pred_date={pred_date}, trade_date={trade_date}")
+
+            # 检查 T+1 的数据是否已更新
+            if trade_date not in calendar_dates:
+                logger.warning(f"交易日 {trade_date} 不在日历中，跳过")
+                remaining_trades.append(pending)
+                continue
+
+            # 检查数据是否已更新到 trade_date 之后
+            if target_date < trade_date:
+                logger.info(f"数据尚未更新到 {trade_date}，等待...")
+                remaining_trades.append(pending)
+                continue
+
+            # T+1 数据已可用，计算收益
+            try:
+                # 恢复 pred_df
+                pred_df_dict = pending.get('pred_df', {})
+                if pred_df_dict:
+                    if isinstance(pred_df_dict, dict):
+                        # 尝试从 predictions 恢复
+                        if self.state.get('predictions') is not None:
+                            pred_df = self.state['predictions']
+                            if hasattr(pred_df.index, 'get_level_values'):
+                                pred_dates = pred_df.index.get_level_values('datetime').unique()
+                                pred_dates_str = [d.strftime('%Y-%m-%d') for d in pred_dates]
+                                if pred_date in pred_dates_str:
+                                    pred_df = pred_df.xs(pd.Timestamp(pred_date), level='datetime')
+                        else:
+                            # 需要从 pred_df_dict 恢复
+                            try:
+                                # pred_df_dict 是 {stock_code: score} 格式
+                                # 需要转换为 MultiIndex 格式
+                                pred_df = pd.Series(pred_df_dict)
+                                # 转换为 MultiIndex 格式
+                                pred_df = pd.DataFrame({'score': pred_df})
+                                pred_df.index = pd.MultiIndex.from_product(
+                                    [[pd.Timestamp(pred_date)], pred_df.index],
+                                    names=['datetime', 'instrument']
+                                )
+                                pred_df = pred_df['score']
+                            except Exception as e:
+                                logger.warning(f"无法恢复 pred_df: {e}")
+                                continue
+                    else:
+                        pred_df = pred_df_dict
+                else:
+                    # 使用当前预测
+                    pred_df = self.state.get('predictions', pd.Series())
+                    if not pred_df.empty and hasattr(pred_df.index, 'get_level_values'):
+                        pred_dates = pred_df.index.get_level_values('datetime').unique()
+                        pred_dates_str = [d.strftime('%Y-%m-%d') for d in pred_dates]
+                        if pred_date in pred_dates_str:
+                            # 保持 MultiIndex 格式
+                            original_pred_df = pred_df
+                            pred_df = original_pred_df.xs(pd.Timestamp(pred_date), level='datetime')
+                            # 转换回 MultiIndex
+                            pred_df = pd.DataFrame({'score': pred_df})
+                            pred_df.index = pd.MultiIndex.from_product(
+                                [[pd.Timestamp(pred_date)], pred_df.index],
+                                names=['datetime', 'instrument']
+                            )
+                            pred_df = pred_df['score']
+
+                if pred_df.empty:
+                    logger.warning(f"pred_df 为空，无法计算收益")
+                    remaining_trades.append(pending)
+                    continue
+
+                # 运行 qlib 回测来计算收益
+                logger.info(f"[pending] 使用 qlib 计算 {trade_date} 的收益...")
+                backtest_result = self._run_qlib_backtest_with_pred(pred_df, trade_date)
+
+                if backtest_result and not backtest_result.get('pending', False):
+                    # 计算收益并更新状态
+                    self._apply_backtest_result(trade_date, backtest_result)
+                    calculated_count += 1
+                    logger.info(f"[pending] {trade_date} 收益计算完成")
+                else:
+                    remaining_trades.append(pending)
+
+            except Exception as e:
+                logger.error(f"计算 pending 收益失败: {e}")
+                import traceback
+                traceback.print_exc()
+                remaining_trades.append(pending)
+
+        # 更新 pending_trades 列表
+        self.state['pending_trades'] = remaining_trades
+        if remaining_trades:
+            logger.info(f"仍有 {len(remaining_trades)} 个 pending 交易等待数据更新")
+
+        return calculated_count
+
+    def _run_qlib_backtest_with_pred(self, pred_df: pd.Series, date: str) -> dict:
+        """
+        使用指定的预测数据运行 qlib 单日回测
+
+        Args:
+            pred_df: 预测数据 Series
+            date: 交易日期
+
+        Returns:
+            dict: 回测结果
+        """
+        from qlib.contrib.evaluate import backtest_daily
+        from qlib.contrib.strategy import TopkDropoutStrategy
+        from qlib.backtest.position import Position
+
+        # 获取当前持仓
+        positions = self.state['account'].get('positions', {})
+        current_holdings = {s: p for s, p in positions.items() if isinstance(p, dict) and p.get('shares', 0) > 0}
+
+        # 初始化策略
+        backtest_config = self.config.get('backtest', {})
+        live_config = self.config.get('live_backtest', {})
+
+        STRATEGY_CONFIG = {
+            "topk": live_config.get('topk', 10),
+            "n_drop": live_config.get('n_drop', 5),
+            "signal": pred_df,
+        }
+
+        strategy_obj = TopkDropoutStrategy(**STRATEGY_CONFIG)
+
+        # 初始化账户
+        initial_cash = backtest_config.get('account', 100000000)
+        account_value = self.state['account'].get('total_value', initial_cash)
+
+        if not current_holdings:
+            account = account_value
+        else:
+            account = Position()
+            account.reset_stock()
+            for stock, pos_info in current_holdings.items():
+                shares = pos_info.get('shares', 0)
+                if shares > 0:
+                    account.update_pos(stock, shares)
+
+        # 运行回测
+        exchange_kwargs = backtest_config.get('exchange_kwargs', {
+            "limit_threshold": 0.095,
+            "deal_price": "close",
+            "open_cost": 0.0005,
+            "close_cost": 0.0015,
+            "min_cost": 5,
+        })
+
+        logger.info(f"[qlib回测] 运行回测: {date}")
+        report_df, positions_df = backtest_daily(
+            start_time=date,
+            end_time=date,
+            strategy=strategy_obj,
+            account=account,
+            benchmark=backtest_config.get('benchmark', 'SH000300'),
+            exchange_kwargs=exchange_kwargs,
+        )
+
+        # 提取结果
+        result = {
+            'date': date,
+            'trades': [],
+            'pending': False,
+            'portfolio': {
+                'cash': self.state['account'].get('cash', 0),
+                'total_value': account_value,
+                'positions': current_holdings,
+            }
+        }
+
+        try:
+            if report_df is not None and not report_df.empty:
+                if 'total_value' in report_df.columns:
+                    result['portfolio']['total_value'] = float(report_df['total_value'].iloc[-1])
+                if 'cash' in report_df.columns:
+                    result['portfolio']['cash'] = float(report_df['cash'].iloc[-1])
+
+            if positions_df is not None and not positions_df.empty:
+                latest_date = list(positions_df.keys())[-1]
+                if latest_date in positions_df:
+                    new_positions = positions_df[latest_date]
+                    if hasattr(new_positions, 'get_stock_list'):
+                        stock_list = new_positions.get_stock_list()
+                        new_holdings = {}
+                        for stock in stock_list:
+                            shares = new_positions.get_stock_amount(stock)
+                            if shares > 0:
+                                new_holdings[stock] = {'shares': shares}
+                        result['portfolio']['positions'] = new_holdings
+
+        except Exception as e:
+            logger.warning(f"提取回测结果失败: {e}")
+
+        return result
+
+    def _apply_backtest_result(self, date: str, backtest_result: dict):
+        """
+        应用回测结果到状态
+
+        Args:
+            date: 交易日期
+            backtest_result: 回测结果
+        """
+        portfolio = backtest_result.get('portfolio', {})
+
+        # 更新账户
+        self.state['account']['cash'] = portfolio.get('cash', self.state['account']['cash'])
+        self.state['account']['total_value'] = portfolio.get('total_value', self.state['account']['total_value'])
+        self.state['account']['positions'] = portfolio.get('positions', self.state['account']['positions'])
+
+        # 计算收益
+        history = self.state['history']
+        prev_total = history['total_values'][-1] if history['total_values'] else self.config['backtest']['account']
+        current_total = self.state['account']['total_value']
+
+        daily_return = (current_total - prev_total) / prev_total
+
+        # 更新历史
+        history['dates'].append(date)
+        history['returns'].append(daily_return)
+        history['total_values'].append(current_total)
+        self.state['history'] = history
+        self.state['last_update_date'] = date
+
+        logger.info(f"[pending] 收益已应用: date={date}, return={daily_return*100:.4f}%, "
+                   f"total_value={current_total:,.0f}")
 
     def _build_handler_config(self, end_date: str = None) -> dict:
         """构建 handler 配置"""
@@ -329,11 +861,37 @@ class LiveBacktest:
 
         return model_configs[model_key]
 
-    def init(self):
-        """首次初始化"""
+    def init(self, download_data: bool = True):
+        """首次初始化
+
+        Args:
+            download_data: 是否自动下载最新数据，默认 True
+        """
         logger.info("=" * 60)
         logger.info("开始初始化实盘模拟系统")
         logger.info("=" * 60)
+
+        # 初始化 state（必须在调用 _update_data 之前）
+        self.state = {}
+
+        # 删除历史状态文件（init 是首次初始化，需要全新开始）
+        if self.state_file.exists():
+            logger.info(f"删除历史状态文件: {self.state_file}")
+            self.state_file.unlink()
+
+        # 0. 下载最新数据（新增）
+        target_date = None
+        if download_data:
+            logger.info("步骤 0/3: 下载最新数据...")
+            target_date = self._get_latest_trading_day()
+            logger.info(f"目标日期: {target_date}")
+
+            success = self._update_data(target_date, force_full=True)
+            if not success:
+                logger.warning("数据下载失败，继续使用已有数据")
+                target_date = None
+        else:
+            logger.info("跳过数据下载（download_data=False）")
 
         # 1. 训练初始模型
         logger.info("步骤 1/3: 训练初始模型...")
@@ -356,8 +914,18 @@ class LiveBacktest:
         backtest_config = self.config.get('backtest', {})
         initial_cash = backtest_config.get('account', 100000000)
 
+        # 如果没有下载数据，尝试从 qlib 获取最后日期
+        if target_date is None:
+            try:
+                from qlib.data import D
+                calendar = D.calendar(freq='day')
+                target_date = calendar[-1].strftime('%Y-%m-%d')
+            except:
+                target_date = datetime.now().strftime('%Y-%m-%d')
+
         state = {
             'last_update_date': None,
+            'last_data_update_date': target_date,  # 新增字段
             'last_train_date': last_train_date,
             'account': {
                 'cash': initial_cash,
@@ -369,7 +937,8 @@ class LiveBacktest:
                 'returns': [],
                 'total_values': []
             },
-            'model_path': model_path
+            'model_path': model_path,
+            'pending_trades': [],  # 待计算收益的交易列表
         }
 
         self.state = state
@@ -409,7 +978,7 @@ class LiveBacktest:
             date: 交易日期（T+1日），默认为最新交易日
             state: 外部传入的状态，如果为 None 则从文件加载
         """
-        # 确定运行日期
+        # 0. 确定运行日期
         if date is None:
             date = self._get_latest_trading_day()
         else:
@@ -424,7 +993,7 @@ class LiveBacktest:
         logger.info(f"[{date}] 开始每日回测")
         logger.info("=" * 60)
 
-        # 加载状态
+        # 0.1 加载状态
         if state is not None:
             # 使用外部传入的状态
             self.state = state
@@ -434,6 +1003,42 @@ class LiveBacktest:
         if self.state is None:
             logger.error("未找到状态文件，请先运行 init 初始化")
             return
+
+        # 0.2 检查是否已经处理过这个日期（防止重复）
+        history = self.state.get('history', {})
+        if date in history.get('dates', []):
+            logger.warning(f"⚠️  日期 {date} 已经处理过，跳过")
+            logger.info(f"如需重新处理，请先删除状态文件或手动编辑历史记录")
+            return
+
+        # 0.3 检查并更新数据（新增）
+        live_config = self.config.get('live_backtest', {})
+        if live_config.get('download_data', False):
+            logger.info("检查数据更新...")
+            last_data_date = self.state.get('last_data_update_date')
+
+            if last_data_date is None:
+                logger.warning("状态文件中没有 last_data_update_date，尝试从 qlib 获取")
+                from qlib.data import D
+                try:
+                    calendar = D.calendar(freq='day')
+                    last_data_date = calendar[-1].strftime('%Y-%m-%d')
+                    self.state['last_data_update_date'] = last_data_date
+                except:
+                    last_data_date = '2024-01-01'
+
+            # 比较日期
+            if date > last_data_date:
+                logger.info(f"需要更新数据: {last_data_date} → {date}")
+                success = self._update_data(date, force_full=False)
+                if not success:
+                    logger.warning("数据更新失败，继续使用已有数据")
+            elif date == last_data_date:
+                logger.info(f"✅ 数据已是最新（{last_data_date}），无需更新")
+            else:
+                logger.info(f"目标日期 {date} 早于数据更新日期 {last_data_date}，无需更新")
+        else:
+            logger.info("自动数据更新已禁用（config.live_backtest.download_data=False）")
 
         logger.info(f"当前账户: 现金={self.state['account']['cash']:,.0f}, "
                    f"总资产={self.state['account']['total_value']:,.0f}")
@@ -446,46 +1051,119 @@ class LiveBacktest:
         else:
             logger.info("使用现有模型")
 
-        # 2. 获取前一日的预测信号（T日预测T+1日）
-        # 找到 date 的前一个交易日
-        logger.info("步骤 2/5: 获取前一日预测信号（T日预测T+1日）...")
+        # 2. 确定预测数据日期和交易日期
+        # 逻辑：
+        # - date 参数是你想要用于预测的数据日期（T）
+        # - trade_date 是 T 的下一个交易日（T+1），是实际执行交易的日期
+        # - 如果 T+1 的数据已可用，则计算收益
+        logger.info("步骤 2/5: 获取预测信号...")
         from qlib.data import D
         calendar = D.calendar(freq='day')
-        try:
-            date_idx = list(calendar).index(pd.Timestamp(date))
-            if date_idx == 0:
-                logger.warning("这是第一个交易日，没有前一日数据，跳过")
-                return
-            prev_date = calendar[date_idx - 1].strftime('%Y-%m-%d')
-            logger.info(f"使用 {prev_date} 的预测数据指导 {date} 的交易")
-        except (ValueError, IndexError) as e:
-            logger.error(f"无法找到 {date} 的前一交易日: {e}")
+        calendar_dates = [d.strftime('%Y-%m-%d') for d in calendar]
+
+        # 检查 date 是否在交易日历中
+        if date not in calendar_dates:
+            logger.error(f"[daily] 日期 {date} 不在交易日历中，无法进行回测")
+            logger.info(f"可用的交易日历范围: {calendar_dates[0]} ~ {calendar_dates[-1]}")
             return
 
-        predictions = self.predict(prev_date)
+        # 找到 date 在日历中的位置，确定 T+1
+        date_idx = list(calendar).index(pd.Timestamp(date))
+
+        if date_idx >= len(calendar) - 1:
+            # date 是最后一天，T+1 不存在
+            logger.info(f"[daily] {date} 是交易日历的最后一天")
+            logger.info(f"[daily] 使用 {date} 的数据预测下一交易日（等待 T+1 数据更新后计算收益）")
+            trade_date = None
+        else:
+            # T+1 存在
+            trade_date = calendar[date_idx + 1].strftime('%Y-%m-%d')
+            logger.info(f"[daily] 预测数据日期: {date} (T)")
+            logger.info(f"[daily] 交易/收益计算日期: {trade_date} (T+1)")
+
+        # 使用 date 的数据生成预测
+        predictions = self.predict(date)
 
         if predictions is None or predictions.empty:
             logger.warning("预测结果为空，跳过今日交易")
             return
 
         logger.info(f"预测股票数量: {len(predictions)}")
-        topk = self.config.get('live_backtest', {}).get('topk', 50)
+        topk = self.config.get('live_backtest', {}).get('topk', 10)
         logger.info(f"选择 Top-{topk} 股票作为交易信号")
 
-        # 3. 执行虚拟交易（在 date 这天执行）
-        logger.info("步骤 3/5: 执行虚拟交易...")
-        self.execute_trades(predictions, date)
+        # 保存预测和预测日期
+        self.state['predictions'] = predictions
+        self.state['pred_date'] = date
+        logger.info(f"预测已保存: 用 {date} (T) 数据预测")
 
-        # 4. 计算收益
-        logger.info("步骤 4/5: 计算收益...")
-        daily_return = self.calculate_return(date)
+        # 3. 检查 T+1 数据是否可用，决定是否计算收益
+        if trade_date is not None:
+            # T+1 在日历中，检查数据是否已更新到 T+1
+            latest_qlib_date = self._get_latest_data_date_from_qlib()
 
-        if daily_return is not None:
-            logger.info(f"当日收益率: {daily_return*100:.4f}%")
-            total_return = (self.state['account']['total_value'] / self.config['backtest']['account'] - 1) * 100
-            logger.info(f"累计收益率: {total_return:.2f}%")
+            if latest_qlib_date and latest_qlib_date >= trade_date:
+                # T+1 数据已可用，执行交易并计算收益
+                logger.info(f"[daily] T+1 ({trade_date}) 数据已可用，执行交易...")
+                logger.info(f"[daily] 使用 qlib 回测系统执行交易...")
+                backtest_result = self._run_qlib_backtest(trade_date)
 
-        # 5. 生成图表
+                if backtest_result and not backtest_result.get('pending', False):
+                    # 成功计算收益
+                    logger.info("步骤 3/5: 执行虚拟交易... (已完成)")
+                    logger.info("步骤 4/5: 计算收益... (已完成)")
+                    daily_return = self.calculate_return(trade_date, backtest_result)
+
+                    if daily_return is not None:
+                        logger.info(f"当日收益率: {daily_return*100:.4f}%")
+                        total_return = (self.state['account']['total_value'] / self.config['backtest']['account'] - 1) * 100
+                        logger.info(f"累计收益率: {total_return:.2f}%")
+                else:
+                    # pending 或失败
+                    logger.info("步骤 3/5: 执行虚拟交易... (pending)")
+                    logger.info("步骤 4/5: 计算收益... (pending)")
+            else:
+                # T+1 数据不可用，只保存信号
+                logger.info(f"[daily] T+1 ({trade_date}) 数据尚未更新，保存信号等待")
+                logger.info("步骤 3/5: 执行虚拟交易... (pending)")
+                logger.info("步骤 4/5: 计算收益... (pending)")
+
+                # 获取当前预测数据
+                predictions = self.state.get('predictions', pd.Series())
+                if hasattr(predictions, 'to_dict'):
+                    pred_dict = predictions.to_dict()
+                else:
+                    pred_dict = predictions if isinstance(predictions, dict) else {}
+
+                # 标记为 pending
+                self.state['last_update_date'] = date
+                # 保存 pending trade 信息（包含 pred_df）
+                pending_trade = {
+                    'pred_date': date,
+                    'trade_date': trade_date,
+                    'pred_df': pred_dict,
+                }
+                self.state.setdefault('pending_trades', []).append(pending_trade)
+
+                # 删除 predictions（不需要持久化）
+                if 'predictions' in self.state:
+                    del self.state['predictions']
+                if 'pred_date' in self.state:
+                    del self.state['pred_date']
+        else:
+            # date 是最后一天，保存为 pending
+            logger.info("[daily] 保存为 pending，等待下一个交易日...")
+            logger.info("步骤 3/5: 执行虚拟交易... (pending)")
+            logger.info("步骤 4/5: 计算收益... (pending)")
+            self.state['last_update_date'] = date
+
+            # 删除 predictions（不需要持久化）
+            if 'predictions' in self.state:
+                del self.state['predictions']
+            if 'pred_date' in self.state:
+                del self.state['pred_date']
+
+        # 5. 生成图表（如果有收益数据的话）
         logger.info("步骤 5/5: 生成图表...")
         self.generate_plots(date)
 
@@ -526,6 +1204,7 @@ class LiveBacktest:
 
         self.state = {
             'last_update_date': None,
+            'last_data_update_date': end_date,  # 模拟时使用 end_date
             'last_train_date': None,
             'account': {
                 'cash': initial_cash,
@@ -537,7 +1216,8 @@ class LiveBacktest:
                 'returns': [],
                 'total_values': []
             },
-            'model_path': None
+            'model_path': None,
+            'pending_trades': [],  # 待计算收益的交易列表
         }
 
         # 首次训练
@@ -680,6 +1360,53 @@ class LiveBacktest:
 
         return None
 
+    def _get_latest_data_date_from_qlib(self) -> str:
+        """
+        从 qlib 数据库获取最新的数据日期
+
+        Returns:
+            str: 最新数据日期（YYYY-MM-DD 格式），如果没有数据返回 None
+        """
+        try:
+            from qlib.data import D
+            calendar = D.calendar(freq='day')
+            if len(calendar) == 0:
+                logger.warning("qlib 日历为空，数据可能未正确加载")
+                return None
+            latest_date = calendar[-1].strftime('%Y-%m-%d')
+            logger.debug(f"从 qlib 获取到最新数据日期: {latest_date}")
+            return latest_date
+        except Exception as e:
+            logger.warning(f"从 qlib 获取日期失败: {e}")
+            return None
+
+    def _get_latest_data_date(self) -> str:
+        """
+        获取最新的数据日期（依次尝试多种方式）
+
+        Returns:
+            str: 最新数据日期（YYYY-MM-DD 格式）
+        """
+        # 1. 先尝试从 qlib 获取（最可靠）
+        qlib_date = self._get_latest_data_date_from_qlib()
+        if qlib_date:
+            return qlib_date
+
+        # 2. 从本地数据目录获取
+        local_date = self._get_local_data_latest_date()
+        if local_date:
+            return local_date
+
+        # 3. 回退到 config 中的 end_date
+        data_config = self.config.get('data', {})
+        end_date = str(data_config.get('end_date', '20250101'))
+        normalized = self._normalize_date(end_date)
+        if normalized:
+            return normalized
+
+        # 4. 最后手段：返回今天
+        return datetime.now().strftime('%Y-%m-%d')
+
     def predict(self, date: str):
         """
         对指定日期进行预测
@@ -723,20 +1450,46 @@ class LiveBacktest:
         logger.info(f"获取 {date} 的特征数据...")
 
         try:
+            # 动态获取最新数据日期（不再依赖 config 中的 end_date）
+            latest_data_date = self._get_latest_data_date()
+            logger.info(f"使用数据截止日期: {latest_data_date}（动态获取）")
+
             # 构建数据集配置
             train_config = self.config.get('train', {})
-            handler_config = self._build_handler_config(end_date=date)
+
+            # 使用动态获取的 latest_data_date 作为 end_date，确保能获取到 date 的数据
+            handler_config = self._build_handler_config(end_date=latest_data_date)
             dataset_config = self._build_dataset_config(handler_config, train_config)
 
             # 修改测试集为指定日期
             dataset_config['kwargs']['segments']['test'] = [date, date]
 
+            logger.info(f"数据集配置: end_time={handler_config['end_time']}, test=[{date}, {date}]")
             logger.info("准备数据集...")
             dataset = init_instance_by_config(dataset_config)
 
             # 获取测试数据（包含股票代码和特征）
             logger.info("获取测试数据...")
             test_data = dataset.prepare('test')
+
+            # 验证数据是否包含请求的日期
+            if test_data.empty:
+                logger.error(f"错误: 没有获取到 {date} 的数据！")
+                logger.error(f"可能原因: 1) 数据尚未更新到 {date}; 2) 日期不在交易日历中")
+                logger.error(f"可用数据日期范围请检查 qlib 数据库")
+                return None
+
+            # 检查 test_data 的日期索引
+            if hasattr(test_data.index, 'get_level_values'):
+                data_dates = test_data.index.get_level_values('datetime').unique()
+                data_dates_str = [d.strftime('%Y-%m-%d') for d in data_dates]
+            else:
+                data_dates_str = []
+
+            if date not in data_dates_str and data_dates_str:
+                logger.warning(f"警告: 请求的日期 {date} 不在获取的数据中")
+                logger.warning(f"获取到的数据日期: {data_dates_str[:5]}... (共 {len(data_dates_str)} 个)")
+                # 不返回 None，允许使用已有数据继续
 
             # test_data 是 DataFrame，索引是 (datetime, instrument) MultiIndex
             # 提取股票代码
@@ -772,212 +1525,283 @@ class LiveBacktest:
             traceback.print_exc()
             return None
 
-    def _get_alpha_feature_names(self) -> list:
-        """获取 Alpha158 的特征字段列表"""
-        # Alpha158 使用的特征字段（158个因子）
-        # 这里列出主要的特征字段
-
-        # 基础价格和成交量特征 (10个)
-        basic_features = [
-            '$close', '$open', '$high', '$low', '$volume', '$amount',
-            '$turn', '$pct_chg', '$adj_close', '$adj_factor',
-        ]
-
-        # 技术指标特征 - 动量 (约30个)
-        momentum_features = [
-            '$resi', '$delta', '$chg', '$pct_chg',
-            '$indmom', '$stock_returns', '$stock_wgt',
-        ]
-
-        # 时序特征 (约40个)
-        tail_features = [
-            '$tail', '$max', '$min', '$zscore', '$subind',
-            '$tsh', '$sratio', '$sharpe', '$sort',
-        ]
-
-        # 成交额特征 (约20个)
-        volume_features = [
-            '$vm', '$vma', '$vstd', '$vr', '$alpha',
-        ]
-
-        # 布林带和波动率特征 (约15个)
-        bollinger_features = [
-            '$bbands', '$bb_up', '$bb_low', '$bb_range', '$bb_width',
-        ]
-
-        # 其他常见特征 (约40个)
-        other_features = [
-            '$return_1', '$return_3', '$return_5', '$return_10', '$return_20',
-            '$volume_1', '$volume_3', '$volume_5', '$volume_10', '$volume_20',
-            '$amount_1', '$amount_3', '$amount_5', '$amount_10', '$amount_20',
-            '$close_1', '$close_3', '$close_5', '$close_10', '$close_20',
-            '$high_1', '$high_3', '$high_5', '$high_10', '$high_20',
-            '$low_1', '$low_3', '$low_5', '$low_10', '$low_20',
-        ]
-
-        # 组合所有特征
-        all_features = (basic_features + momentum_features + tail_features +
-                       volume_features + bollinger_features + other_features)
-
-        return all_features
-
-    def execute_trades(self, predictions: pd.Series, date: str):
+    def _run_qlib_backtest(self, date: str):
         """
-        执行虚拟交易
+        使用 qlib 内置回测系统执行交易
+
+        backtest_daily + TopkDropoutStrategy 的逻辑：
+        - 使用 T-1 日的预测信号
+        - 在 T 日执行交易
+        - 用 T+1 的价格计算收益
+
+        Args:
+            date: 交易日期
+
+        Returns:
+            dict: 回测结果，包含 trades 和 portfolio info
+        """
+        from qlib.contrib.evaluate import backtest_daily
+        from qlib.contrib.strategy import TopkDropoutStrategy
+        from qlib.backtest.position import Position
+
+        # 从状态中获取预测数据和预测日期
+        predictions = self.state.get('predictions')
+        pred_date = self.state.get('pred_date')
+
+        if predictions is None or pred_date is None:
+            logger.error("[qlib回测] 未找到预测数据，请先执行预测")
+            return None
+
+        logger.info(f"[qlib回测] 开始回测")
+        logger.info(f"[qlib回测] 预测日期(T): {pred_date}, 交易日期(T+1): {date}")
+
+        # 2. 获取交易日历并检查是否是最后一天
+        from qlib.data import D
+        calendar = D.calendar(freq='day')
+        calendar_dates = [d.strftime('%Y-%m-%d') for d in calendar]
+
+        if date not in calendar_dates:
+            logger.warning(f"[qlib回测] 日期 {date} 不在交易日历中，跳过")
+            return None
+
+        date_idx = calendar_dates.index(date)
+        is_last_day = (date_idx >= len(calendar_dates) - 1)
+
+        # 3. 检查 predictions 的索引格式
+        # qlib TopkDropoutStrategy 需要 MultiIndex 格式 (datetime, instrument)
+        if hasattr(predictions.index, 'get_level_values'):
+            # MultiIndex 格式 (datetime, instrument)
+            pred_dates = predictions.index.get_level_values('datetime').unique()
+            pred_dates_str = [d.strftime('%Y-%m-%d') for d in pred_dates]
+
+            if pred_date in pred_dates_str:
+                # 保持 MultiIndex 格式，只保留 pred_date 的数据
+                pred_df = predictions.xs(pd.Timestamp(pred_date), level='datetime')
+                # 将单层索引转换回 MultiIndex（datetime=pred_date, instrument=stock）
+                pred_df = pd.DataFrame({'score': pred_df})
+                pred_df.index = pd.MultiIndex.from_product(
+                    [[pd.Timestamp(pred_date)], pred_df.index],
+                    names=['datetime', 'instrument']
+                )
+                pred_df = pred_df['score']  # 转回 Series
+            else:
+                logger.warning(f"[qlib回测] 预测中没有 {pred_date} 的数据")
+                # 使用最新日期的预测
+                latest_pred_date = pred_dates[-1]
+                pred_df = predictions.xs(latest_pred_date, level='datetime')
+                # 转换回 MultiIndex
+                pred_df = pd.DataFrame({'score': pred_df})
+                pred_df.index = pd.MultiIndex.from_product(
+                    [[latest_pred_date], pred_df.index],
+                    names=['datetime', 'instrument']
+                )
+                pred_df = pred_df['score']
+                pred_date = latest_pred_date.strftime('%Y-%m-%d')
+                logger.info(f"[qlib回测] 使用 {pred_date} 的预测")
+        else:
+            # 已经是单层索引，转换为 MultiIndex
+            logger.info(f"[qlib回测] predictions 是单层索引，转换为 MultiIndex")
+            pred_df = pd.DataFrame({'score': predictions})
+            pred_df.index = pd.MultiIndex.from_product(
+                [[pd.Timestamp(pred_date)], predictions.index],
+                names=['datetime', 'instrument']
+            )
+            pred_df = pred_df['score']
+
+        logger.info(f"[qlib回测] 使用 {len(pred_df)} 只股票的预测信号")
+
+        # 4. 最后一天处理：只保存信号，不计算收益
+        if is_last_day:
+            logger.info(f"[qlib回测] {date} 是交易日历的最后一天，无法计算收益")
+            logger.info(f"[qlib回测] 保存交易信号，明天获取 T+1 数据后再计算收益")
+
+            # 保存 pending trade 信息到状态文件
+            pending_trade = {
+                'pred_date': pred_date,  # 预测数据日期
+                'trade_date': date,      # 交易日期
+                'pred_df': pred_df.to_dict() if hasattr(pred_df, 'to_dict') else {},
+            }
+            self.state.setdefault('pending_trades', []).append(pending_trade)
+
+            # 删除 predictions（不需要持久化，pending_trades 中已有 pred_df）
+            if 'predictions' in self.state:
+                del self.state['predictions']
+            if 'pred_date' in self.state:
+                del self.state['pred_date']
+
+            logger.info(f"[qlib回测] pending_trades 已保存: {len(self.state['pending_trades'])} 个待计算收益")
+            self._save_state(self.state)
+
+            result = {
+                'date': date,
+                'trades': [],
+                'pending': True,  # 标记为待计算
+                'portfolio': {
+                    'cash': self.state['account'].get('cash', 0),
+                    'total_value': self.state['account'].get('total_value', 0),
+                    'positions': self.state['account'].get('positions', {}),
+                }
+            }
+            return result
+
+        # 5. 获取当前持仓信息
+        positions = self.state['account'].get('positions', {})
+        current_holdings = {s: p for s, p in positions.items() if isinstance(p, dict) and p.get('shares', 0) > 0}
+
+        # 6. 初始化 TopkDropoutStrategy
+        backtest_config = self.config.get('backtest', {})
+        live_config = self.config.get('live_backtest', {})
+
+        STRATEGY_CONFIG = {
+            "topk": live_config.get('topk', 10),
+            "n_drop": live_config.get('n_drop', 5),
+            "signal": pred_df,
+        }
+
+        strategy_obj = TopkDropoutStrategy(**STRATEGY_CONFIG)
+
+        # 7. 初始化账户
+        initial_cash = backtest_config.get('account', 100000000)
+        account_value = self.state['account'].get('total_value', initial_cash)
+
+        # 如果没有持仓，用初始现金创建 Position
+        if not current_holdings:
+            account = account_value
+        else:
+            # 有持仓时需要用 Position 对象
+            account = Position()
+            account.reset_stock()
+            for stock, pos_info in current_holdings.items():
+                shares = pos_info.get('shares', 0)
+                if shares > 0:
+                    account.update_pos(stock, shares)
+
+        # 8. 运行回测（只回测一天）
+        exchange_kwargs = backtest_config.get('exchange_kwargs', {
+            "limit_threshold": 0.095,
+            "deal_price": "close",
+            "open_cost": 0.0005,
+            "close_cost": 0.0015,
+            "min_cost": 5,
+        })
+
+        logger.info(f"[qlib回测] 运行单日回测: {date}, 账户={account_value:,.0f}")
+        report_df, positions_df = backtest_daily(
+            start_time=date,
+            end_time=date,
+            strategy=strategy_obj,
+            account=account,
+            benchmark=backtest_config.get('benchmark', 'SH000300'),
+            exchange_kwargs=exchange_kwargs,
+        )
+
+        # 9. 提取结果
+        result = {
+            'date': date,
+            'trades': [],
+            'pending': False,
+            'portfolio': {
+                'cash': self.state['account'].get('cash', 0),
+                'total_value': account_value,
+                'positions': current_holdings,
+            }
+        }
+
+        try:
+            if report_df is not None and not report_df.empty:
+                logger.debug(f"[qlib回测] 报告列: {report_df.columns.tolist()}")
+                logger.debug(f"[qlib回测] 报告摘要:\n{report_df.iloc[:3]}")
+
+                # 从 report_df 提取账户信息
+                if 'total_value' in report_df.columns:
+                    final_value = float(report_df['total_value'].iloc[-1])
+                    result['portfolio']['total_value'] = final_value
+                    logger.info(f"[qlib回测] 账户总价值: {final_value:,.0f}")
+
+                if 'cash' in report_df.columns:
+                    result['portfolio']['cash'] = float(report_df['cash'].iloc[-1])
+
+            if positions_df is not None and not positions_df.empty:
+                logger.debug(f"[qlib回测] 持仓日期: {list(positions_df.keys())[:3]}...")
+                # 更新持仓信息
+                latest_date = list(positions_df.keys())[-1]
+                if latest_date in positions_df:
+                    new_positions = positions_df[latest_date]
+                    if hasattr(new_positions, 'get_stock_list'):
+                        stock_list = new_positions.get_stock_list()
+                        new_holdings = {}
+                        for stock in stock_list:
+                            shares = new_positions.get_stock_amount(stock)
+                            if shares > 0:
+                                new_holdings[stock] = {'shares': shares}
+                        result['portfolio']['positions'] = new_holdings
+                        logger.info(f"[qlib回测] 持仓股票数: {len(new_holdings)}")
+
+        except Exception as e:
+            logger.warning(f"[qlib回测] 提取结果失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+        logger.info(f"[qlib回测] 完成: 现金={result['portfolio']['cash']:,.0f}, "
+                   f"总资产={result['portfolio']['total_value']:,.0f}")
+
+        # 删除 predictions（不需要持久化）
+        if 'predictions' in self.state:
+            del self.state['predictions']
+        if 'pred_date' in self.state:
+            del self.state['pred_date']
+
+        return result
+
+    def execute_trades(self, predictions: pd.Series, date: str) -> dict:
+        """
+        执行虚拟交易（使用 qlib 内置回测系统）
 
         Args:
             predictions: 预测结果
             date: 交易日期
+
+        Returns:
+            dict: 回测结果
         """
-        from qlib.data import D
+        logger.info(f"使用 qlib 回测系统执行 {date} 的交易")
 
-        live_config = self.config.get('live_backtest', {})
-        topk = live_config.get('topk', 50)
+        # 预测已在 daily() 中保存，这里直接运行 qlib 回测
+        # predictions 已保存到 self.state['predictions']
+        # pred_date 已保存到 self.state['pred_date']
 
-        # predictions.index 可能是 MultiIndex (datetime, instrument)
-        # 需要正确提取股票代码
-        if hasattr(predictions.index, 'get_level_values'):
-            # MultiIndex 情况
-            stock_codes_all = predictions.index.get_level_values('instrument').unique().tolist()
-        else:
-            stock_codes_all = predictions.index.tolist()
-
-        # 获取目标股票列表（Top-K）
-        top_predictions = predictions.nlargest(topk)
-
-        # 从 Top-K 预测中提取股票代码
-        if hasattr(top_predictions.index, 'get_level_values'):
-            top_stocks = top_predictions.index.get_level_values('instrument').tolist()
-        else:
-            top_stocks = top_predictions.index.tolist()
-
-        # 过滤掉不在预测结果中的股票
-        top_stocks = [s for s in top_stocks if s in stock_codes_all]
-
-        if not top_stocks:
-            logger.warning("没有有效的目标股票")
-            return
-
-        logger.info(f"目标股票数量: {len(top_stocks)}")
-
-        # 获取当前持仓股票列表
-        positions = self.state['account']['positions']
-        current_holdings = [s for s, pos in positions.items() if pos.get('shares', 0) > 0]
-
-        # 需要获取价格的股票 = 当前持仓 + 目标股票
-        stocks_to_price = list(set(current_holdings + top_stocks))
-
-        # 获取当前价格
-        try:
-            # 获取收盘价 - 使用正确的 D.features API
-            fields = ['$close']
-            price_data = D.features(
-                instruments=stocks_to_price,
-                fields=fields,
-                start_time=date,
-                end_time=date,
-            )
-
-            if price_data.empty:
-                logger.warning(f"无法获取 {date} 的价格数据")
-                return
-
-            # 提取收盘价 - price_data 格式为 MultiIndex (datetime, instrument)
-            # 使用 .unstack() 将其转换为 (instrument, datetime) 格式
-            prices_df = price_data.unstack(level='instrument')
-
-            if prices_df.empty:
-                logger.warning("价格数据为空")
-                return
-
-            # 获取收盘价列
-            if '$close' in prices_df.columns:
-                prices = prices_df['$close'].iloc[0]
-            else:
-                # 尝试其他可能的名字
-                prices = prices_df.iloc[:, 0]
-
-            # 确保 prices 是 Series，索引是股票代码
-            if isinstance(prices, pd.DataFrame):
-                prices = prices.iloc[:, 0]
-
-            prices.name = None
-            prices.index.name = None
-
-        except Exception as e:
-            logger.error(f"获取价格数据失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-
-        # 卖出逻辑
-        cash = self.state['account']['cash']
-
-        sell_logs = []
-        for stock in list(positions.keys()):
-            shares = positions[stock].get('shares', 0)
-            if shares > 0 and stock not in top_stocks:
-                # 卖出不在目标列表中的股票
-                if stock in prices.index:
-                    price = prices.get(stock)
-                    if pd.notna(price) and price > 0:
-                        sell_value = shares * price
-                        positions[stock]['shares'] = 0
-                        cash += sell_value
-                        sell_logs.append(f"  卖出 {stock}: {shares} 股 @ {price:.2f} = {sell_value:,.0f}")
-                else:
-                    logger.warning(f"  无法获取 {stock} 的价格，跳过卖出")
-
-        for log in sell_logs:
-            logger.info(log)
-
-        # 买入逻辑
-        available_cash = cash * 0.95
-        buy_count = 0
-        for s in top_stocks:
-            current_shares = positions.get(s, {}).get('shares', 0)
-            if current_shares == 0 and s in prices.index:
-                price = prices.get(s)
-                if pd.notna(price) and price > 0:
-                    buy_count += 1
-
-        cash_per_stock = available_cash / buy_count if buy_count > 0 else 0
-
-        buy_logs = []
-        for stock in top_stocks:
-            current_shares = positions.get(stock, {}).get('shares', 0)
-            if current_shares == 0 and stock in prices.index:
-                price = prices.get(stock)
-                if pd.notna(price) and price > 0:
-                    shares = int(cash_per_stock / price)
-                    if shares > 0:
-                        cost = shares * price
-                        positions[stock] = {'shares': shares, 'avg_cost': price}
-                        cash -= cost
-                        buy_logs.append(f"  买入 {stock}: {shares} 股 @ {price:.2f} = {cost:,.0f}")
-
-        for log in buy_logs:
-            logger.info(log)
+        # 运行 qlib 回测
+        backtest_result = self._run_qlib_backtest(date)
 
         # 更新状态
-        self.state['account']['positions'] = positions
-        self.state['account']['cash'] = cash
+        if backtest_result and backtest_result.get('portfolio'):
+            portfolio = backtest_result['portfolio']
+            self.state['account']['cash'] = portfolio.get('cash', self.state['account']['cash'])
+            self.state['account']['total_value'] = portfolio.get('total_value', self.state['account']['total_value'])
+            self.state['account']['positions'] = portfolio.get('positions', self.state['account']['positions'])
+            logger.info(f"账户已更新: 现金={self.state['account']['cash']:,.0f}, "
+                       f"总资产={self.state['account']['total_value']:,.0f}")
 
-        # 计算持仓市值
-        position_value = 0
-        for s in positions:
-            if s in prices.index:
-                price = prices.get(s)
-                if pd.notna(price):
-                    position_value += positions[s]['shares'] * price
+        return backtest_result
 
-        self.state['account']['total_value'] = cash + position_value
-        logger.info(f"当前现金: {cash:,.0f}, 持仓市值: {position_value:,.0f}, 总资产: {self.state['account']['total_value']:,.0f}")
-
-    def calculate_return(self, date: str) -> float:
+    def calculate_return(self, date: str, backtest_result: dict = None) -> float:
         """
         计算当日收益
+
+        Args:
+            date: 交易日期
+            backtest_result: 可选的回测结果，用于检查是否是 pending 状态
+
+        Returns:
+            float: 当日收益率，如果未计算则返回 None
         """
+        # 检查是否是 pending 状态（最后一天的情况）
+        if backtest_result and backtest_result.get('pending'):
+            logger.info(f"[{date}] 是最后交易日，收益待明天 T+1 数据更新后计算")
+            # 只更新时间，不记录收益
+            self.state['last_update_date'] = date
+            return None
+
         history = self.state['history']
         prev_total = history['total_values'][-1] if history['total_values'] else self.config['backtest']['account']
         current_total = self.state['account']['total_value']
@@ -1179,6 +2003,49 @@ class LiveBacktest:
             f.write(f"胜率: {(returns > 0).mean()*100:.2f}%\n")
         logger.info(f"统计信息已保存到: {stats_file}")
 
+    def check_pending(self):
+        """
+        手动检查并计算 pending 收益
+
+        用于测试或在数据更新后手动触发 pending 计算
+        """
+        logger.info("=" * 60)
+        logger.info("手动检查 pending 交易")
+        logger.info("=" * 60)
+
+        # 加载状态
+        self.state = self._load_state()
+        if self.state is None:
+            logger.error("未找到状态文件，请先运行 init 初始化")
+            return
+
+        pending_trades = self.state.get('pending_trades', [])
+        if not pending_trades:
+            logger.info("没有待计算的 pending 交易")
+            return
+
+        logger.info(f"发现 {len(pending_trades)} 个 pending 交易")
+
+        # 获取当前 qlib 数据最后日期
+        latest_qlib_date = self._get_latest_data_date_from_qlib()
+        logger.info(f"当前 qlib 数据最后日期: {latest_qlib_date}")
+
+        # 手动触发 pending 计算
+        calculated = self._calculate_pending_returns(latest_qlib_date)
+
+        if calculated > 0:
+            logger.info(f"成功计算 {calculated} 个 pending 交易的收益")
+            self._save_state(self.state)
+
+            # 重新生成图表
+            if self.state.get('history', {}).get('dates'):
+                last_date = self.state['history']['dates'][-1]
+                self.generate_plots(last_date)
+        else:
+            logger.info("没有可以计算的 pending 交易（T+1 数据尚未更新）")
+
+        logger.info("=" * 60)
+
 
 def main():
     """主函数"""
@@ -1187,6 +2054,7 @@ def main():
         'init': backtest.init,
         'daily': backtest.daily,
         'simulate': backtest.simulate,
+        'check_pending': backtest.check_pending,
     })
 
 

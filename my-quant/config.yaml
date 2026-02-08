@@ -13,7 +13,7 @@ data:
 # 训练配置
 train:
   # 模型选择: LightGBM, XGBoost, catboost_model, pytorch_gru
-  model: pytorch_gru
+  model: LightGBM
 
   # 可选: 自定义模型配置 (覆盖预设模板)
   # model_config:
@@ -53,3 +53,24 @@ backtest:
     open_cost: 0.0005
     close_cost: 0.0015
     min_cost: 5
+
+# 实盘模拟持续回测配置
+live_backtest:
+  enabled: true
+  download_data: true          # 是否每天下载最新数据
+  retrain_frequency: "weekly"  # 重新训练频率: daily/weekly/monthly/never
+  initial_cash: 100000000      # 初始资金
+  topk: 50                     # 每次选择的股票数量
+  n_drop: 5                    # 调仓时换出股票数量
+  state_file: .live_backtest_state.json  # 状态文件路径
+
+# Online Serving 配置 (基于 qlib OnlineManager)
+online_serving:
+  enabled: true
+  rolling_step: 252            # 滚动训练步长（交易日），约1年
+  retrain_day: "monday"        # 重新训练日: monday/tuesday/wednesday/thursday/friday
+  initial_cash: 100000000      # 初始资金
+  topk: 50                     # TopkDropout 策略参数
+  n_drop: 5                    # 调仓时换出股票数量
+  benchmark: SH000300          # 基准指数
+  state_file: .online_serving_state.json  # 状态文件路径
