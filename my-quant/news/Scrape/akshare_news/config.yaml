@@ -1,0 +1,29 @@
+# 财联社电报爬虫配置
+
+# 数据存储路径
+data_dir: "../../../../data/macro_news"
+
+# 爬虫配置
+scraper:
+  # 请求超时时间（秒）
+  timeout: 30
+  # 请求间隔（秒），避免过于频繁
+  request_interval: 2
+  # 重试次数
+  max_retries: 3
+  # 默认使用的方法: "api" 或 "selenium"
+  default_method: "api"
+
+# selenium 配置（备用方案）
+selenium:
+  # 浏览器类型: "chrome", "firefox"
+  browser: "chrome"
+  # 是否使用 headless 模式
+  headless: true
+  # 窗口大小
+  window_size: [1400, 900]
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
