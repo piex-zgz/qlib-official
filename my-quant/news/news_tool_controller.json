@@ -1,0 +1,42 @@
+{
+  "reddit_payload": {
+    "enabled": true,
+    "db_path": "D:/Quant-qlib-official/data/reddit_posts.db",
+    "source_table": "reddit_posts",
+    "flair_keywords": [
+      "news",
+      "new"
+    ],
+    "case_sensitive": false,
+    "match_mode": "contains_any",
+    "exclude_empty_flair": true,
+    "subreddits": [],
+    "start_datetime": null,
+    "end_datetime": null,
+    "min_score": null,
+    "order_by": "datetime_desc",
+    "limit_total": 500,
+    "limit_per_subreddit": 200,
+    "pack_by_subreddit": true,
+    "subreddit_from_url": true,
+    "route_by_original_subreddit": true,
+    "route_field_name": "route_subreddit",
+    "include_fields": [
+      "post_id",
+      "datetime",
+      "date_only",
+      "subreddit",
+      "title",
+      "content",
+      "flair",
+      "author",
+      "score",
+      "num_comments",
+      "url",
+      "external_link",
+      "permalink"
+    ],
+    "output_json_path": "D:/Quant-qlib-official/data/static/reddit/reddit_news_payload.json",
+    "output_pretty": true
+  }
+}
